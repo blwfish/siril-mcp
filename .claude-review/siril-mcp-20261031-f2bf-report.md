@@ -103,3 +103,13 @@ Test review:
 - No regression of any d1bf/5e7a fix (angles 3 and 4 read both ledger passes and the 53691e2 diff).
 - Every `run_checked` caller only returns, discards or embeds the log, so summarising breaks none of them; the header format, the `(path, err)` tuple, the `run_checked` raise/return contract, the fake-Siril protocol shapes, the env-var names and defaults, and session notices surviving at the head of the summary all agree between their two sides with a catching mechanism.
 - Test suite at HEAD: 135 passed, 0 failed; coverage 96.24% (floor 90%). **Test Stats** — pass:135 fail:0 mutants:26/54 survived tautology:0
+
+## Remediation
+Fixed in 3bfffd6 (35 findings): all 4 High and all 15 Medium, plus the Lows in the same locations (#10, #11, #12, #14, #17, #18, #20, #21, #22, #25-#28, #58, #60, #61). Test suite 135 → 209 tests, 96.7% coverage; a mutation spot-check of 27 new mutants on the summary code ended with none surviving (after four were pinned by new tests).
+- **#01** the summary now keeps rare lines from both ends (a third of the budget goes to the end) and says how many it dropped from the middle; **#05/#50** headings and notes are counted exactly, the output never exceeds the limit, and the limit has a floor of 2000.
+- **#03** pruning only touches files `_save_full_log` named, never the one just written, and reports failed deletions; **#02** the file is the text as received and the wording says so.
+- **#12/#09** `SIRIL_MCP_LOG_LIMIT` and `SIRIL_MCP_TIMEOUT` are validated at start; `SIRIL_MCP_LOG_DIR` is expanded.
+- **#06/#08** the tool description and server instructions quote the limit in force; `siril_help` is returned whole.
+- **#04** reduced to wording: lines differing only in numbers are still grouped, and the README and heading say so.
+
+Not fixed: 19 deferred Lows (#15, #16, #31-#47: other locations, no known occurrence) and 7 wontfix (#13, #19, #23, #24, #29, #30, #59), each with its reason in the ledger.
