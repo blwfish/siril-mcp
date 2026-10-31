@@ -13,7 +13,8 @@ claude mcp add siril -- /Volumes/Files/claude/siril-mcp/siril_mcp.py
 ```
 
 Env: `SIRIL_BIN` (path to `siril-cli`; falls back to `siril-cli` on `PATH`, then `/opt/homebrew/bin/siril-cli`),
-`SIRIL_MCP_TIMEOUT` (seconds, default 300; see *Timeouts*).
+`SIRIL_MCP_TIMEOUT` (seconds, default 300; see *Timeouts*),
+`SIRIL_MCP_LOG_LIMIT` (characters, default 20000; see *Long logs*), `SIRIL_MCP_LOG_DIR` (default `~/.cache/siril-mcp/logs`).
 
 ## Tools
 
@@ -35,6 +36,14 @@ Tool calls are serialised: one runs at a time.
   dies by itself, the next command starts a fresh one and the result begins with a notice saying so.
 - **Bad input never resets the session.** Empty or multi-line commands, `@script` invocations, over-long commands
   and paths containing `"` or newlines are rejected up front (Siril has no way to escape them).
+- **Long logs are summarised (*Long logs*).** A command that logs more than `SIRIL_MCP_LOG_LIMIT` characters (a
+  400-frame `calibrate` logs about 54,000) comes back as a short summary that begins `[log shortened: N lines, M
+  characters; full log saved to <path>]`. Lines whose shape (the line with its numbers masked) occurs at most 3
+  times are shown verbatim and in order, so warnings, errors and closing totals survive; commoner shapes are
+  listed as `count x example`. If the rare lines or the kinds don't fit, the summary says how many were left out.
+  If the full log can't be written, the header says `could NOT be saved` and why. Nothing is judged by keyword or
+  meaning, and the saved log is complete and unaltered. The same summary appears in the error text of a failed
+  command. The newest 50 saved logs are kept. The limit is soft below a few thousand characters.
 - **`exit` / `quit`** end the Siril process cleanly; the next command starts a new one.
 - **`@script.ssf` is not supported:** a script emits no completion status over the pipe, so its end cannot be
   detected. Send its commands one at a time.

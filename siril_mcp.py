@@ -31,6 +31,7 @@ import enum
 import math
 import os
 import queue
+import re
 import select
 import shlex
 import shutil
@@ -39,6 +40,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +55,11 @@ POLL_S = 0.2  # how often a waiter checks that the Siril process is still alive
 MAX_COMMAND_BYTES = 4096  # a command line must fit the pipe buffer so the write cannot block
 MAX_LINE_BYTES = 1 << 20  # a "line" longer than this without a newline is split and flagged
 MAX_LOG_CHARS = 1_000_000  # returned log text is capped, with a visible marker
+RETURN_LOG_CHARS = int(os.environ.get("SIRIL_MCP_LOG_LIMIT", "20000"))  # a longer log is summarised, not returned whole
+LOG_DIR = Path(os.environ.get("SIRIL_MCP_LOG_DIR") or Path.home() / ".cache" / "siril-mcp" / "logs")
+MAX_LOG_FILES = 50  # full logs kept in LOG_DIR; the oldest are pruned
+RARE_LINE_MAX = 3  # a line shape seen at most this often is shown verbatim in a summary
+MAX_SHAPES_SHOWN = 15  # most-repeated line shapes listed in a summary
 EXIT_COMMANDS = frozenset({"exit", "quit"})
 DEFAULT_PREVIEW_DIM = 2048  # long side of a preview JPEG; keeps it within typical image-size limits
 
@@ -145,6 +152,86 @@ def _quote(arg: str, what: str) -> str:
             f"{what} may not contain a double quote or control character (Siril cannot represent them): {arg!r}"
         )
     return f'"{arg}"'
+
+
+_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _shape(line: str) -> str:
+    """A line with its numbers masked, so 'Reading FITS: file a_00031.fit' and '...a_00032.fit' count as one kind."""
+    return _NUMBER.sub("N", line)
+
+
+def _save_full_log(command: str, log: str) -> tuple[Path | None, str | None]:
+    """Write the complete log under LOG_DIR. Returns (path, None), or (None, reason) when it could not be saved."""
+    verb = re.sub(r"[^A-Za-z0-9_]", "", command.split(None, 1)[0])[:30] or "cmd"
+    stamp = f"{time.time_ns()}-{time.strftime('%Y%m%d-%H%M%S')}"  # the nanosecond prefix keeps names in time order
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(dir=LOG_DIR, prefix=f"{stamp}-{verb}-", suffix=".log")
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(log + "\n")
+    except OSError as e:
+        return None, str(e)
+    try:  # keep only the newest MAX_LOG_FILES
+        for old in sorted(LOG_DIR.glob("*.log"))[:-MAX_LOG_FILES]:
+            old.unlink()
+    except OSError:
+        pass  # housekeeping only: the log just written is already safe
+    return Path(name), None
+
+
+def _cut(line: str, limit: int = 600) -> str:
+    return line if len(line) <= limit else f"{line[:limit]} ...[line cut, {len(line)} characters]"
+
+
+def condense_log(command: str, log: str) -> str:
+    """`log` unchanged if it is short; otherwise a bounded summary that says it is one.
+
+    The summary shows every line shape seen at most RARE_LINE_MAX times, verbatim and in order (a warning, an error or
+    the closing totals are rare by nature), and collapses everything else into 'N x example'. It never decides what a
+    line means, and the complete log is saved to a file whose path is on the first line. The size limit is soft below a
+    few thousand characters, because the summary always lists the most repeated kinds."""
+    if len(log) <= RETURN_LOG_CHARS:
+        return log
+    lines = log.split("\n")
+    shapes = [_shape(ln) for ln in lines]
+    counts = Counter(shapes)
+    example: dict[str, str] = {}
+    for ln, sh in zip(lines, shapes):
+        example.setdefault(sh, ln)
+    path, err = _save_full_log(command, log)
+    where = f"full log saved to {path}" if path else f"full log could NOT be saved ({err})"
+    header = f"[log shortened: {len(lines)} lines, {len(log)} characters; {where}]"
+
+    frequent = [(sh, n) for sh, n in counts.most_common() if n > RARE_LINE_MAX]
+    repeated = [f"  {n:>5}x  {_cut(example[sh] or '(blank line)', 160)}" for sh, n in frequent[:MAX_SHAPES_SHOWN]]
+    more_kinds = max(0, len(frequent) - MAX_SHAPES_SHOWN)
+    repeated_text = "\n".join(repeated)
+
+    budget = RETURN_LOG_CHARS - len(header) - len(repeated_text) - 300  # room for headings and omission notes
+    rare = [_cut(ln) for ln, sh in zip(lines, shapes) if counts[sh] <= RARE_LINE_MAX]
+    shown: list[str] = []
+    used = 0
+    for item in rare:
+        if used + len(item) + 3 > budget:
+            break
+        shown.append(f"  {item}")
+        used += len(item) + 3
+    omitted = len(rare) - len(shown)
+
+    out = [header]
+    if rare:
+        out.append(f"Lines seen at most {RARE_LINE_MAX} times (verbatim, in order):")
+        out.extend(shown)
+        if omitted:
+            out.append(f"[... {omitted} more such line(s) omitted to keep this short; see the full log]")
+    if repeated:
+        out.append("Repeated lines (count x example; numbers are masked when grouping):")
+        out.append(repeated_text)
+        if more_kinds:
+            out.append(f"[... {more_kinds} more repeated kind(s) not listed; see the full log]")
+    return "\n".join(out)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -504,6 +591,7 @@ class SirilSession:
         except SirilError as e:
             self.stop()
             raise RuntimeError(f"{label}: {command!r}: {e} (session reset)") from e
+        log = condense_log(command, log)  # a very long log is summarised; the complete one is saved to a file
         if not ok:
             raise RuntimeError(f"{label} failed: {command}\n{log or '(Siril gave no reason)'}")
         return log
@@ -543,6 +631,8 @@ async def siril_command(command: str, timeout_s: float = DEFAULT_TIMEOUT) -> str
     timeout_s is how long Siril may stay silent before the call is abandoned (and the session reset,
     losing the loaded image); any output, including progress, restarts the clock.
     `exit`/`quit` end the Siril process; the next command starts a fresh one. `@script` is not supported.
+    A log longer than about 20,000 characters comes back as a summary (the first line says so and gives the path of
+    the complete log, saved to a file).
     """
     return await _run(command, timeout_s)
 
