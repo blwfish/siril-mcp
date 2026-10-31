@@ -1,0 +1,15 @@
+[run]
+source = .
+branch = True
+omit =
+    tests/*
+    .claude-review/*
+
+[report]
+show_missing = True
+# Floor-check only: nonzero coverage says the code ran, not that the tests assert anything meaningful.
+fail_under = 90
+skip_empty = True
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
