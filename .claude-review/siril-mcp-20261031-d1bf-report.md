@@ -63,3 +63,13 @@ None.
 - **F03 + F04 + F09 + F05:** a single locked `run` helper that owns reset-on-error, validates `timeout_s`, separates validation errors from fatal session errors, and correlates the terminal status's `<cmd>` echo; `siril_preview` and `_run` both call it.
 - **F06 + F07 + F11:** make the line classifier honest (continuation lines, unknown prefixes counted/surfaced, terminal vocabulary including exit/script).
 - **F12 + F13 + F26:** one quoting/command-table helper and one place that applies the working directory.
+
+## Remediation (2026-10-31)
+
+All 29 findings were fixed in `53691e2` (source, README) and `d30d892` (tests, coverage config); F29 (no tests) is closed by the 116-test suite at 96% line+branch coverage. Where a finding was closed by documenting the behaviour or by a partial mitigation (F04, F08, F11, F17, F22, F23, F27, F28), the ledger entry says exactly what remains.
+
+A cold re-review of the rewrite (`siril-mcp-20261031-5e7a`) found 19 further issues: 10 in the new code and 9 in the new tests. 17 were fixed in the same commits and 2 were closed as wontfix with reasons (resample enlarging small images, now documented; an untestable exit race). No findings are deferred, so no GitHub issues were filed.
+
+Verification: full suite twice (no flakes) and on `mcp` 1.27.0, the declared floor; an end-to-end script against the real `siril-cli` 1.4.5 covering load, stats, preview, help output, `cd` tracking, rejected arguments, SIGKILL recovery and `exit`.
+
+Behaviour changes to know about: `siril_preview` now defaults to a 2048px long side (`max_dim=0` for full size); `@script` commands are rejected (no completion signal over the pipe); `exit`/`quit` are supported; the `mcp` floor is now `>=1.27`.
