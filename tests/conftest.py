@@ -24,10 +24,12 @@ def command_log(tmp_path, monkeypatch) -> Path:
 def session(tmp_path, monkeypatch, command_log):
     """A fresh SirilSession wired to the fake Siril, installed as siril_mcp.session so the tools use it.
 
-    Pipe dirs go under tmp_path (not the real temp dir) so tests can inspect and sweep them."""
+    Pipe dirs go under tmp_path (not the real temp dir) so tests can inspect and sweep them, and saved logs go to
+    tmp_path/saved-logs, never the real ~/.cache/siril-mcp/logs."""
     FAKE_SIRIL.chmod(FAKE_SIRIL.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setattr(siril_mcp, "SIRIL_BIN", str(FAKE_SIRIL))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(siril_mcp, "LOG_DIR", tmp_path / "saved-logs")
     monkeypatch.setattr(siril_mcp, "_gate", asyncio.Lock())  # a lock binds to the first loop that contends on it
     s = siril_mcp.SirilSession()
     s.workdir = str(tmp_path)

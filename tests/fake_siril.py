@@ -18,9 +18,12 @@ Behaviour is chosen by the command's first word so tests can provoke each case:
   chatty        6 log lines 0.2s apart, then success (total run time longer than a short timeout)
   split         a log line delivered in two writes with a pause between them
   partial       a 50-byte log line with no newline, a pause, then the newline
-  spam          ~600 repeated log lines, one rare warning in the middle, then totals (like a long convert)
-  spamfail      the same, ending in status: error
+  spam          ~600 repeated log lines, one rare warning in the middle, then totals (like a long calibrate or register:
+                real convert of FITS logs only a few lines in all, but calibrate and register log per file)
+  spamfail      the same, then an error line and status: error
   distinct      400 log lines that are all different kinds
+  distinctfail  the same, then a final `Error: the real failure` line and status: error
+  help          100 distinct log lines (a command catalogue; real `help` is ~11,000 characters)
   badbytes      a log line containing invalid UTF-8
   spawnchild    starts a `sleep 60` child (pid written to FAKE_SIRIL_CHILD_PID), then success
   exit          status: starting only, then the process exits (real Siril emits no terminal status)
@@ -126,17 +129,28 @@ def main() -> None:
                     f.write(str(child.pid))
                 emit(ok)
             elif name in ("spam", "spamfail"):
-                # like convert/register on 300 files: two repeated lines per file, one rare line in the middle, totals at the end
+                # like calibrate/register on 300 files: two repeated lines per file, one rare line in the middle, totals
+                # at the end. Real Siril echoes "Running command: <verb>" first.
+                emit(f"log: Running command: {name}")
                 for i in range(300):
                     emit(f"log: Reading FITS: file frame_{i:05d}.fit, 3 layer(s), 6064x4040 pixels, 16 bits")
                     if i == 150:
                         emit("log: Warning: something unusual happened in the middle")
                     emit(f"log: Saving FITS: file out_{i:05d}.fit, 3 layer(s), 6064x4040 pixels, 16 bits")
+                if name == "spamfail":
+                    emit("log: Error: registration aborted, 3 frames could not be read")
                 emit("log: Execution time: 3 min 7 s")
                 emit(ok if name == "spam" else f"status: error {name}")
-            elif name == "distinct":
+            elif name in ("distinct", "distinctfail"):
                 for i in range(400):  # every line a different kind: nothing to collapse
                     emit(f"log: item-{chr(97 + i % 26)}{chr(97 + i // 26 % 26)} {chr(97 + i // 676)} lorem ipsum dolor sit amet")
+                if name == "distinctfail":
+                    emit("log: Error: the real failure", f"status: error {name}")
+                else:
+                    emit(ok)
+            elif name == "help":
+                for i in range(100):
+                    emit(f"log: command{chr(97 + i % 26)}{chr(97 + i // 26)} <file> - does something useful to the loaded image")
                 emit(ok)
             elif name == "badbytes":
                 os.write(fout, b"log: caf\xe9\n")

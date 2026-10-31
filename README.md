@@ -13,8 +13,10 @@ claude mcp add siril -- /Volumes/Files/claude/siril-mcp/siril_mcp.py
 ```
 
 Env: `SIRIL_BIN` (path to `siril-cli`; falls back to `siril-cli` on `PATH`, then `/opt/homebrew/bin/siril-cli`),
-`SIRIL_MCP_TIMEOUT` (seconds, default 300; see *Timeouts*),
-`SIRIL_MCP_LOG_LIMIT` (characters, default 20000; see *Long logs*), `SIRIL_MCP_LOG_DIR` (default `~/.cache/siril-mcp/logs`).
+`SIRIL_MCP_TIMEOUT` (seconds, positive and finite, default 300; see *Timeouts*),
+`SIRIL_MCP_LOG_LIMIT` (characters, an integer of at least 2000, default 20000), `SIRIL_MCP_LOG_DIR` (default
+`~/.cache/siril-mcp/logs`; `~` is expanded and a relative path is taken from the server's working directory); for both
+see *Long logs are summarised* below. A bad value stops the server at start, with a message naming the setting.
 
 ## Tools
 
@@ -36,14 +38,22 @@ Tool calls are serialised: one runs at a time.
   dies by itself, the next command starts a fresh one and the result begins with a notice saying so.
 - **Bad input never resets the session.** Empty or multi-line commands, `@script` invocations, over-long commands
   and paths containing `"` or newlines are rejected up front (Siril has no way to escape them).
-- **Long logs are summarised (*Long logs*).** A command that logs more than `SIRIL_MCP_LOG_LIMIT` characters (a
-  400-frame `calibrate` logs about 54,000) comes back as a short summary that begins `[log shortened: N lines, M
-  characters; full log saved to <path>]`. Lines whose shape (the line with its numbers masked) occurs at most 3
-  times are shown verbatim and in order, so warnings, errors and closing totals survive; commoner shapes are
-  listed as `count x example`. If the rare lines or the kinds don't fit, the summary says how many were left out.
-  If the full log can't be written, the header says `could NOT be saved` and why. Nothing is judged by keyword or
-  meaning, and the saved log is complete and unaltered. The same summary appears in the error text of a failed
-  command. The newest 50 saved logs are kept. The limit is soft below a few thousand characters.
+- **Long logs are summarised.** A command that logs more than `SIRIL_MCP_LOG_LIMIT` characters (a 400-frame
+  `calibrate` logs about 54,000) comes back as a summary of at most that size, beginning `[log shortened: N lines, M
+  characters; log saved to <path>]` (on a failed command that is the second line, after `Siril command failed: ...`).
+  Lines whose shape (the line with its numbers masked) occurs at most 3 times are shown in order, each cut at 600
+  characters if longer (`...[line cut, N characters]`); commoner shapes are listed as `count x first example`, the most
+  repeated first, examples cut at 160 characters. Because only numbers are masked, lines that differ only in a number
+  (30 `Error: could not open frame_00017.fit` lines) are grouped and only the first is shown: the saved log has them all.
+  When the rare lines don't all fit, the summary keeps those from the start and from the end of the log (an error or
+  the closing totals come last) and says how many it left out of the middle; the same goes for repeated kinds that
+  don't fit. Nothing is judged by keyword or meaning. The saved file is the log text exactly as the server received it
+  (up to 1,000,000 characters; beyond that an `[output truncated: ...]` line says so), so it is the whole log unless
+  that cap fired. If it can't be written, the header says `log could NOT be saved` and why. The same summary appears in
+  the error text of a failed command. `siril_help` is never summarised (its output is a fixed ~11,000 characters). Each
+  saved log is a file named `<time>-<verb>-<random>.log`; the newest 50 of those are kept and nothing else in the
+  directory is touched (if a deletion fails the header says so). A log is not saved when the command times out or
+  Siril dies; the error then carries only Siril's console tail.
 - **`exit` / `quit`** end the Siril process cleanly; the next command starts a new one.
 - **`@script.ssf` is not supported:** a script emits no completion status over the pipe, so its end cannot be
   detected. Send its commands one at a time.
@@ -66,10 +76,12 @@ the command's first word as typed (not its arguments).
   command is ignored and counted in the result (`[ignored N stale status line(s)...]`), so a late reply from a timed-out
   command cannot answer the next one. A status word outside `starting|success|error` that echoes our command is treated
   as a failed completion rather than waited on.
-- `log:` text is returned unparsed. Unprefixed lines are continuations of a multi-line log message and are kept.
+- `log:` text is returned unparsed, unless it exceeds `SIRIL_MCP_LOG_LIMIT`, when it is summarised (see above).
+  Unprefixed lines are continuations of a multi-line log message and are kept.
   `progress:` lines are dropped on purpose. Output before the command's own `starting` marker (Siril's asynchronous
-  python-module bootstrap logs) belongs to nothing we sent and is dropped. Returned text is capped at 1,000,000
-  characters with a visible marker.
+  python-module bootstrap logs) belongs to nothing we sent and is dropped. The log text collected for one command is
+  capped at 1,000,000 characters with a visible marker; what the caller gets back is then the summary above if it is
+  still over the limit.
 - `exit`/`quit` emit `starting` and then the process ends, with no terminal status; that is detected from the process.
 - Siril's stdout/stderr are kept in the pipe dir and the tail is included in startup and crash errors.
 
@@ -95,6 +107,6 @@ uv run --with 'mcp>=1.27,<2' --with pytest --with pytest-cov pytest --cov
 
 (The `mcp` pin repeats the one in the script header; keep them in step.) `tests/fake_siril.py` stands in for
 `siril-cli -p` and speaks the pipe protocol, with commands that provoke each case (multi-line logs, late status,
-abrupt exit, invalid UTF-8, hung exit...). Test comments cite the review finding (`.claude-review/`) each one pins.
+abrupt exit, invalid UTF-8, hung exit...). Test comments cite the review finding (`.claude-review/`) each one pins; the log-summary tests (`tests/test_logs.py`) instead say what behaviour they pin.
 Coverage is a floor-check only (`fail_under` in `.coveragerc`): it says the code ran, not that the tests assert
 anything meaningful.

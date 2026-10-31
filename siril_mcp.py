@@ -21,7 +21,8 @@ status line to the command we sent, so a late status from an earlier command is 
 `exit`/`quit` emit "starting" and then the process ends, with no terminal status.
 
 Completion and success/failure come only from the `status:` lines (or process exit);
-`log:` text is passed back to the model unparsed.
+`log:` text is passed back to the model unparsed, unless it is longer than RETURN_LOG_CHARS: then it is summarised
+(see condense_log) and the whole log is saved to a file.
 """
 from __future__ import annotations
 
@@ -46,8 +47,31 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 
+
+def _env_number(name: str, default, cast, valid, expected: str):
+    """A numeric setting from the environment: `default` if unset or empty, else the value, which must satisfy `valid`.
+    A bad value stops the server at start with a message that names it, instead of a bare traceback or a surprise later."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        value = None
+    if value is None or not valid(value):
+        raise SystemExit(f"{name} must be {expected} (got {raw!r})")
+    return value
+
+
+def _log_dir_from_env() -> Path:
+    """SIRIL_MCP_LOG_DIR with `~` expanded and made absolute (an env block in an MCP config is not run through a shell)."""
+    return Path(os.environ.get("SIRIL_MCP_LOG_DIR") or "~/.cache/siril-mcp/logs").expanduser().absolute()
+
+
 SIRIL_BIN = os.environ.get("SIRIL_BIN") or shutil.which("siril-cli") or "/opt/homebrew/bin/siril-cli"
-DEFAULT_TIMEOUT = float(os.environ.get("SIRIL_MCP_TIMEOUT", "300"))
+DEFAULT_TIMEOUT = _env_number(
+    "SIRIL_MCP_TIMEOUT", 300.0, float, lambda v: math.isfinite(v) and v > 0, "a positive, finite number of seconds"
+)
 STARTUP_TIMEOUT = 60.0
 TESTED_SIRIL = "1.4."  # the pipe protocol above was observed on 1.4.x; other versions get a notice
 
@@ -55,11 +79,19 @@ POLL_S = 0.2  # how often a waiter checks that the Siril process is still alive
 MAX_COMMAND_BYTES = 4096  # a command line must fit the pipe buffer so the write cannot block
 MAX_LINE_BYTES = 1 << 20  # a "line" longer than this without a newline is split and flagged
 MAX_LOG_CHARS = 1_000_000  # returned log text is capped, with a visible marker
-RETURN_LOG_CHARS = int(os.environ.get("SIRIL_MCP_LOG_LIMIT", "20000"))  # a longer log is summarised, not returned whole
-LOG_DIR = Path(os.environ.get("SIRIL_MCP_LOG_DIR") or Path.home() / ".cache" / "siril-mcp" / "logs")
-MAX_LOG_FILES = 50  # full logs kept in LOG_DIR; the oldest are pruned
+MIN_RETURN_LOG_CHARS = 2000  # below this a summary's own headings and notes would not fit inside the limit
+RETURN_LOG_CHARS = _env_number(  # a longer log is summarised, not returned whole
+    "SIRIL_MCP_LOG_LIMIT", 20000, int, lambda v: v >= MIN_RETURN_LOG_CHARS, f"an integer of at least {MIN_RETURN_LOG_CHARS}"
+)
+LOG_DIR = _log_dir_from_env()
+MAX_LOG_FILES = 50  # saved logs kept in LOG_DIR (this server's own); the oldest are pruned
 RARE_LINE_MAX = 3  # a line shape seen at most this often is shown verbatim in a summary
 MAX_SHAPES_SHOWN = 15  # most-repeated line shapes listed in a summary
+RARE_LINE_CUT = 600  # a verbatim line longer than this is cut, visibly
+EXAMPLE_CUT = 160  # likewise the example shown for a repeated kind
+TAIL_SHARE = 3  # 1/TAIL_SHARE of the verbatim-line budget goes to the END of the log, where errors and totals are
+LOG_VERB_CHARS = 30  # characters of the command verb used in a saved log's file name
+BLANK_LINE = "(blank line)"
 EXIT_COMMANDS = frozenset({"exit", "quit"})
 DEFAULT_PREVIEW_DIM = 2048  # long side of a preview JPEG; keeps it within typical image-size limits
 
@@ -162,76 +194,152 @@ def _shape(line: str) -> str:
     return _NUMBER.sub("N", line)
 
 
+_OWN_LOG = re.compile(r"\d+-\d{8}-\d{6}-.*\.log")  # what _save_full_log names its files; pruning touches only these
+MAX_ERR_CHARS = 200  # an OS error text quoted in a summary header
+
+
+def _marker(text: str) -> str:
+    """A note this server adds to text it returns, as opposed to text that came from Siril."""
+    return f"[{text}]"
+
+
 def _save_full_log(command: str, log: str) -> tuple[Path | None, str | None]:
-    """Write the complete log under LOG_DIR. Returns (path, None), or (None, reason) when it could not be saved."""
-    verb = re.sub(r"[^A-Za-z0-9_]", "", command.split(None, 1)[0])[:30] or "cmd"
+    """Write the log, exactly as received, under LOG_DIR. Returns (path, None), or (None, reason) when it can't be saved."""
+    words = command.split()
+    verb = re.sub(r"[^A-Za-z0-9_]", "", words[0] if words else "")[:LOG_VERB_CHARS] or "cmd"
     stamp = f"{time.time_ns()}-{time.strftime('%Y%m%d-%H%M%S')}"  # the nanosecond prefix keeps names in time order
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        LOG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(dir=LOG_DIR, prefix=f"{stamp}-{verb}-", suffix=".log")
-        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as fh:
-            fh.write(log + "\n")
     except OSError as e:
-        return None, str(e)
-    try:  # keep only the newest MAX_LOG_FILES
-        for old in sorted(LOG_DIR.glob("*.log"))[:-MAX_LOG_FILES]:
-            old.unlink()
-    except OSError:
-        pass  # housekeeping only: the log just written is already safe
+        return None, str(e)[:MAX_ERR_CHARS]
+    try:
+        with open(fd, "w", encoding="utf-8", errors="replace") as fh:  # takes over (and closes) fd
+            fh.write(log)
+    except OSError as e:  # e.g. disk full: do not leave a partial file that would pass for a log
+        try:
+            os.unlink(name)
+        except OSError:
+            pass  # nothing more to do; the failure is reported either way
+        return None, str(e)[:MAX_ERR_CHARS]
     return Path(name), None
 
 
-def _cut(line: str, limit: int = 600) -> str:
-    return line if len(line) <= limit else f"{line[:limit]} ...[line cut, {len(line)} characters]"
+def _prune_logs(keep: Path) -> int:
+    """Delete this server's oldest saved logs beyond MAX_LOG_FILES, counting `keep` (the one just written, which is
+    never deleted). Files in LOG_DIR that _save_full_log did not name are left alone. Returns how many deletions failed."""
+    try:
+        old = sorted(p for p in LOG_DIR.glob("*.log") if p != keep and _OWN_LOG.fullmatch(p.name))
+    except OSError:
+        return 1
+    failed = 0
+    for path in old[: max(0, len(old) - (MAX_LOG_FILES - 1))]:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass  # another server pruned it first
+        except OSError:
+            failed += 1
+    return failed
+
+
+def _cut(line: str, limit: int) -> str:
+    return line if len(line) <= limit else f"{line[:limit]} ...{_marker(f'line cut, {len(line)} characters')}"
+
+
+def _pick_rare(items: list[str], budget: int) -> tuple[list[str], list[str]]:
+    """The verbatim lines to show, as (start, end) of `items`: all of them if they fit in `budget` characters (an
+    item costs its length plus 3 for the indent and newline), otherwise a run from each end, 1/TAIL_SHARE of the
+    budget for the end. The end is where Siril's error and closing totals, and this server's own end-of-log notes, are."""
+    cost = [len(item) + 3 for item in items]
+    if sum(cost) <= budget:
+        return items, []
+    tail_budget = max(0, budget) // TAIL_SHARE
+    head_budget = max(0, budget) - tail_budget
+    head = tail = used = 0
+    while head < len(items) and used + cost[head] <= head_budget:
+        used += cost[head]
+        head += 1
+    used = 0
+    while tail < len(items) - head and used + cost[-1 - tail] <= tail_budget:
+        used += cost[-1 - tail]
+        tail += 1
+    return items[:head], items[len(items) - tail:]
 
 
 def condense_log(command: str, log: str) -> str:
-    """`log` unchanged if it is short; otherwise a bounded summary that says it is one.
+    """`log` unchanged if it is short; otherwise a summary, at most RETURN_LOG_CHARS long, that says it is one.
 
     The summary shows every line shape seen at most RARE_LINE_MAX times, verbatim and in order (a warning, an error or
-    the closing totals are rare by nature), and collapses everything else into 'N x example'. It never decides what a
-    line means, and the complete log is saved to a file whose path is on the first line. The size limit is soft below a
-    few thousand characters, because the summary always lists the most repeated kinds."""
+    the closing totals are rare by nature), and collapses everything else into 'N x first example'. When the rare lines
+    don't fit it keeps those from both ends of the log and says how many it left out of the middle. It never decides what
+    a line means. The log is saved to a file whose path is in the first line."""
     if len(log) <= RETURN_LOG_CHARS:
         return log
+    limit = RETURN_LOG_CHARS
     lines = log.split("\n")
     shapes = [_shape(ln) for ln in lines]
     counts = Counter(shapes)
-    example: dict[str, str] = {}
+    first: dict[str, str] = {}
     for ln, sh in zip(lines, shapes):
-        example.setdefault(sh, ln)
+        first.setdefault(sh, ln)
     path, err = _save_full_log(command, log)
-    where = f"full log saved to {path}" if path else f"full log could NOT be saved ({err})"
-    header = f"[log shortened: {len(lines)} lines, {len(log)} characters; {where}]"
+    if path:
+        pruned_failed = _prune_logs(path)
+        where = f"log saved to {path}" + (f"; could not delete {pruned_failed} old log(s) in {LOG_DIR}" if pruned_failed else "")
+    else:
+        where = f"log could NOT be saved ({err})"
+    header = _marker(f"log shortened: {len(lines)} lines, {len(log)} characters; {where}")
+    rare_heading = f"Lines seen at most {RARE_LINE_MAX} times (verbatim, in order):"
+    repeated_heading = "Repeated lines (count x first example; lines that differ only in their numbers are grouped):"
 
     frequent = [(sh, n) for sh, n in counts.most_common() if n > RARE_LINE_MAX]
-    repeated = [f"  {n:>5}x  {_cut(example[sh] or '(blank line)', 160)}" for sh, n in frequent[:MAX_SHAPES_SHOWN]]
-    more_kinds = max(0, len(frequent) - MAX_SHAPES_SHOWN)
-    repeated_text = "\n".join(repeated)
-
-    budget = RETURN_LOG_CHARS - len(header) - len(repeated_text) - 300  # room for headings and omission notes
-    rare = [_cut(ln) for ln, sh in zip(lines, shapes) if counts[sh] <= RARE_LINE_MAX]
-    shown: list[str] = []
-    used = 0
-    for item in rare:
-        if used + len(item) + 3 > budget:
+    repeated: list[str] = []
+    repeated_chars = 0
+    for sh, n in frequent[:MAX_SHAPES_SHOWN]:
+        entry = f"  {n:>5}x  {_cut(first[sh] or BLANK_LINE, EXAMPLE_CUT)}"
+        if repeated_chars + len(entry) + 1 > limit // 3:  # the repeated kinds may not crowd out the rare lines
             break
-        shown.append(f"  {item}")
-        used += len(item) + 3
-    omitted = len(rare) - len(shown)
+        repeated.append(entry)
+        repeated_chars += len(entry) + 1
+    more_kinds = len(frequent) - len(repeated)
+    kinds_note = _marker(f"... {more_kinds} more repeated kind(s) not listed; see the saved log") if more_kinds else ""
+
+    rare = [_cut(ln or BLANK_LINE, RARE_LINE_CUT) for ln, sh in zip(lines, shapes) if counts[sh] <= RARE_LINE_MAX]
+    gap_note = _marker(f"... {len(rare)} more such line(s) omitted from the middle to keep this short; see the saved log")
+    fixed = [header, rare_heading if rare else "", gap_note if rare else "", repeated_heading if repeated else "", kinds_note]
+    budget = limit - sum(len(s) + 1 for s in fixed) - repeated_chars
+    head, tail = _pick_rare(rare, budget)
+    omitted = len(rare) - len(head) - len(tail)
 
     out = [header]
     if rare:
-        out.append(f"Lines seen at most {RARE_LINE_MAX} times (verbatim, in order):")
-        out.extend(shown)
+        out.append(rare_heading)
+        out.extend(f"  {item}" for item in head)
         if omitted:
-            out.append(f"[... {omitted} more such line(s) omitted to keep this short; see the full log]")
+            out.append(_marker(f"... {omitted} more such line(s) omitted from the middle to keep this short; see the saved log"))
+        out.extend(f"  {item}" for item in tail)
     if repeated:
-        out.append("Repeated lines (count x example; numbers are masked when grouping):")
-        out.append(repeated_text)
+        out.append(repeated_heading)
+        out.extend(repeated)
         if more_kinds:
-            out.append(f"[... {more_kinds} more repeated kind(s) not listed; see the full log]")
+            out.append(kinds_note)
     return "\n".join(out)
+
+
+def _condensed(command: str, log: str) -> str:
+    """condense_log(), but a bug in it must not discard the result of a command that has already run: fall back to the
+    start and end of the log, with a note saying why."""
+    try:
+        return condense_log(command, log)
+    except Exception as e:  # noqa: BLE001 - deliberately broad: whatever went wrong, the caller still needs the log
+        half = max(0, RETURN_LOG_CHARS - 300) // 2
+        return "\n".join([
+            _marker(f"log summary failed ({type(e).__name__}: {e}); showing only the first and last {half} characters"),
+            log[:half],
+            _marker(f"... {max(0, len(log) - 2 * half)} characters omitted ..."),
+            log[len(log) - half:],
+        ])
 
 
 def _pid_alive(pid: int) -> bool:
@@ -431,7 +539,7 @@ class SirilSession:
                 for raw in complete:
                     q.put(raw.decode("utf-8", "replace").rstrip("\r"))
                 if len(buf) > MAX_LINE_BYTES:
-                    q.put(buf.decode("utf-8", "replace") + f" [line split: exceeded {MAX_LINE_BYTES} bytes]")
+                    q.put(buf.decode("utf-8", "replace") + " " + _marker(f"line split: exceeded {MAX_LINE_BYTES} bytes"))
                     buf = b""
         except (OSError, ValueError) as e:  # ValueError: select on a closed fd
             if not stop.is_set():
@@ -568,7 +676,7 @@ class SirilSession:
         if stale:
             out.append(f"[ignored {stale} stale status line(s) from earlier commands]")
         if truncated:
-            out.append(f"[output truncated: {truncated} further line(s) dropped after {MAX_LOG_CHARS} characters]")
+            out.append(_marker(f"output truncated: {truncated} further line(s) dropped after {MAX_LOG_CHARS} characters"))
         return "\n".join(out)
 
     def _track_cd(self, command: str) -> None:
@@ -580,8 +688,13 @@ class SirilSession:
         if len(args) == 1:
             self.workdir = os.path.normpath(os.path.join(self.workdir, os.path.expanduser(args[0])))
 
-    def run_checked(self, command: str, timeout: float | None = None, label: str = "Siril command") -> str:
+    def run_checked(
+        self, command: str, timeout: float | None = None, label: str = "Siril command", condense: bool = True
+    ) -> str:
         """run(), but a failure raises RuntimeError. Caller holds `lock`.
+
+        A log longer than RETURN_LOG_CHARS is summarised (and saved to a file), in the result and in the error text
+        alike, unless `condense` is False (only for output whose size does not depend on the caller's data).
 
         A SirilError (timeout, process exit, IO failure) also resets the session: Siril may still be running the
         command, so nothing sent next could be trusted. InvalidCommand propagates unchanged, session intact."""
@@ -591,14 +704,21 @@ class SirilSession:
         except SirilError as e:
             self.stop()
             raise RuntimeError(f"{label}: {command!r}: {e} (session reset)") from e
-        log = condense_log(command, log)  # a very long log is summarised; the complete one is saved to a file
+        if condense:
+            log = _condensed(command, log)
         if not ok:
             raise RuntimeError(f"{label} failed: {command}\n{log or '(Siril gave no reason)'}")
         return log
 
 
 session = SirilSession()
-mcp = FastMCP("siril")
+LOG_NOTE = (
+    f"A log longer than {RETURN_LOG_CHARS:,} characters comes back as a summary, not whole: it begins "
+    "'[log shortened: ...; log saved to <path>]' (on a failed command that is the second line, after the failure line), "
+    "lists the lines that occur only a few times verbatim, counts the commonly repeated ones, and says what it left out. "
+    "The path is a text file with the whole log."
+)
+mcp = FastMCP("siril", instructions=LOG_NOTE)
 _gate = asyncio.Lock()  # one tool call at a time, queued on the event loop rather than parked on threads
 
 
@@ -613,15 +733,22 @@ async def _in_session(fn):
             raise
 
 
-async def _run(command: str, timeout: float | None = None) -> str:
+async def _run(command: str, timeout: float | None = None, condense: bool = True) -> str:
     def work() -> str:
         with session.lock:
-            return session.run_checked(command, timeout)
+            return session.run_checked(command, timeout, condense=condense)
 
     return await _in_session(work)
 
 
+def _documented(fn):
+    """Fill the `{log_note}` placeholder in a tool's docstring, so the limit it quotes is the one in force."""
+    fn.__doc__ = fn.__doc__.format(log_note=LOG_NOTE)
+    return fn
+
+
 @mcp.tool()
+@_documented
 async def siril_command(command: str, timeout_s: float = DEFAULT_TIMEOUT) -> str:
     """Run one raw Siril command (e.g. "stat", "autostretch", "rmgreen", "starnet").
 
@@ -631,8 +758,7 @@ async def siril_command(command: str, timeout_s: float = DEFAULT_TIMEOUT) -> str
     timeout_s is how long Siril may stay silent before the call is abandoned (and the session reset,
     losing the loaded image); any output, including progress, restarts the clock.
     `exit`/`quit` end the Siril process; the next command starts a fresh one. `@script` is not supported.
-    A log longer than about 20,000 characters comes back as a summary (the first line says so and gives the path of
-    the complete log, saved to a file).
+    {log_note}
     """
     return await _run(command, timeout_s)
 
@@ -640,7 +766,7 @@ async def siril_command(command: str, timeout_s: float = DEFAULT_TIMEOUT) -> str
 @mcp.tool()
 async def siril_help(command: str = "") -> str:
     """List all Siril commands, or show the syntax of one (e.g. command="autostretch")."""
-    return await _run(f"help {command}".strip())
+    return await _run(f"help {command}".strip(), condense=False)  # a fixed ~11,000-character catalogue: show it whole
 
 
 @mcp.tool()
